@@ -1,8 +1,12 @@
-﻿# Sensitive files - never commit these
+# Sensitive files - never commit these
 credentials.json
 knowledge_base.json
-seen_jobs.db
+*.db
 .env
+
+# Personal utility scripts - not part of the public repo
+quick_test.py
+reset.py
 
 # Python
 __pycache__/
@@ -20,6 +24,10 @@ pip-log.txt
 venv/
 .venv/
 env/
+
+# Playwright
+.playwright/
+node_modules/
 
 # IDE
 .vscode/

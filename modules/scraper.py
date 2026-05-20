@@ -103,63 +103,126 @@ class JobScraper:
             tab.goto(job_url, wait_until="domcontentloaded", timeout=15_000)
             tab.wait_for_timeout(2_000)
 
+            # ── Title / Company / Location ────────────────────────────────
+            # h1 and aria-label patterns are stable; class names are hashed
             result["title"] = self._first_text(tab, [
-                "h1.job-details-jobs-unified-top-card__job-title",
-                ".jobs-unified-top-card__job-title h1",
-                "h1.t-24",
+                "h1[class*='job-title']",
+                "h1[class*='top-card']",
+                "h1",
             ])
-            result["company"] = self._first_text(tab, [
-                ".job-details-jobs-unified-top-card__company-name a",
-                ".jobs-unified-top-card__company-name a",
-                ".job-details-jobs-unified-top-card__company-name",
-            ])
-            result["location"] = self._first_text(tab, [
-                ".job-details-jobs-unified-top-card__bullet",
-                ".jobs-unified-top-card__bullet",
-                ".job-details-jobs-unified-top-card__workplace-type",
-            ])
+            result["company"] = tab.evaluate("""() => {
+                const a = [...document.querySelectorAll('a[href*="/company/"]')]
+                    .find(el => el.innerText.trim().length > 0
+                          && !el.innerText.toLowerCase().includes('linkedin'));
+                return a ? a.innerText.trim() : '';
+            }""") or ""
+            result["location"] = tab.evaluate("""() => {
+                const spans = [...document.querySelectorAll('span')]
+                    .filter(el => {
+                        const t = el.innerText.trim();
+                        return t.length > 3 && t.length < 80
+                            && /remote|hybrid|on.?site|,\s*[A-Z]{2}|India|US|UK/i.test(t)
+                            && el.children.length === 0;
+                    });
+                return spans.length ? spans[0].innerText.trim() : '';
+            }""") or ""
 
+            # ── See More / Show More (aria-label or exact button text) ────
             try:
-                see_more = tab.query_selector(
-                    "button.jobs-description__footer-button, "
-                    "button[aria-label='Click to see more description']"
-                )
-                if see_more:
-                    see_more.click()
-                    tab.wait_for_timeout(500)
+                tab.evaluate("""() => {
+                    const btn =
+                        document.querySelector('button[aria-label*="more" i]') ||
+                        [...document.querySelectorAll('button')]
+                            .find(b => /^(see|show) more$/i.test(b.innerText.trim()));
+                    if (btn) btn.click();
+                }""")
+                tab.wait_for_timeout(600)
             except Exception:
                 pass
 
-            result["description"] = self._first_text(tab, [
-                "#job-details",
+            # ── Description (#job-details is a stable ID on LinkedIn) ─────
+            result["description"] = tab.evaluate("""() => {
+                const el = document.querySelector('#job-details')
+                    || document.querySelector('[id*="job-details"]');
+                return el ? el.innerText.trim() : '';
+            }""") or self._first_text(tab, [
                 ".jobs-description__content",
                 ".job-details-about-the-job-module__description",
             ])
 
-            apply_btn = tab.query_selector(
-                ".jobs-apply-button--top-card, "
-                ".jobs-apply-button, "
-                "button[data-job-id]"
-            )
-            if apply_btn:
-                btn_text = apply_btn.inner_text().lower()
-                if "easy apply" in btn_text:
+            # ── Apply button ──────────────────────────────────────────────
+            # aria-label is injected by LinkedIn's JS and never hashed
+            apply_info = tab.evaluate("""() => {
+                // 1. aria-label: Easy Apply
+                let btn = document.querySelector('button[aria-label*="Easy Apply" i]');
+                if (btn) return { is_easy: true, href: null };
+
+                // 2. aria-label: any Apply button
+                btn = document.querySelector('button[aria-label*="Apply" i]');
+                if (btn) {
+                    if (/easy apply/i.test(btn.innerText)) return { is_easy: true, href: null };
+                    const wrap = btn.closest('div') || btn.parentElement;
+                    const a = wrap ? wrap.querySelector('a[href]') : null;
+                    return { is_easy: false, href: a ? a.href : null };
+                }
+
+                // 3. text-content fallback
+                btn = [...document.querySelectorAll('button')]
+                    .find(b => /apply/i.test(b.innerText));
+                if (btn) {
+                    if (/easy apply/i.test(btn.innerText)) return { is_easy: true, href: null };
+                    const wrap = btn.closest('div') || btn.parentElement;
+                    const a = wrap ? wrap.querySelector('a[href]') : null;
+                    return { is_easy: false, href: a ? a.href : null };
+                }
+
+                // 4. <a> whose href contains "apply" but is not a LinkedIn search link
+                const link = [...document.querySelectorAll('a[href]')]
+                    .find(a => /apply/i.test(a.href)
+                               && !/linkedin\.com\/jobs/.test(a.href));
+                if (link) return { is_easy: false, href: link.href };
+
+                return null;
+            }""")
+            if apply_info:
+                if apply_info.get("is_easy"):
                     result["is_easy_apply"] = True
                     result["apply_url"] = "LinkedIn Easy Apply"
-                else:
-                    href = apply_btn.get_attribute("href")
-                    if href:
-                        result["apply_url"] = href
+                elif apply_info.get("href"):
+                    result["apply_url"] = apply_info["href"]
 
-            recruiter_el = tab.query_selector(
-                ".hirer-card__hirer-information a, "
-                ".job-details-hiring-company-module a, "
-                "[data-live-test-hiring-details-recruiter] a"
-            )
-            if recruiter_el:
-                result["recruiter_name"] = recruiter_el.inner_text().strip()
-                result["recruiter_linkedin"] = recruiter_el.get_attribute("href")
+            # ── Recruiter ─────────────────────────────────────────────────
+            # Strategy 1: "Meet the hiring team" / "Job poster" section header
+            # Strategy 2: any visible /in/ profile link on the page
+            recruiter_info = tab.evaluate("""() => {
+                // walk up from a section-header element to find the /in/ link inside
+                const headers = [...document.querySelectorAll('h2, h3, span, p')]
+                    .filter(el =>
+                        /meet the hiring team|job poster|hiring team/i
+                            .test(el.innerText.trim())
+                    );
+                for (const hdr of headers) {
+                    let container = hdr.parentElement;
+                    for (let i = 0; i < 6; i++) {
+                        if (!container) break;
+                        const a = container.querySelector('a[href*="/in/"]');
+                        if (a && a.innerText.trim().length > 1)
+                            return { name: a.innerText.trim(), href: a.href };
+                        container = container.parentElement;
+                    }
+                }
+                // fallback: first visible linkedin.com/in/ link with non-empty text
+                const links = [...document.querySelectorAll('a[href*="linkedin.com/in/"]')]
+                    .filter(a => a.innerText.trim().length > 1);
+                if (links.length)
+                    return { name: links[0].innerText.trim(), href: links[0].href };
+                return null;
+            }""")
+            if recruiter_info:
+                result["recruiter_name"] = recruiter_info.get("name") or None
+                result["recruiter_linkedin"] = recruiter_info.get("href") or None
 
+            # ── Recruiter email (regex over description text) ─────────────
             if result["description"]:
                 m = re.search(
                     r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",

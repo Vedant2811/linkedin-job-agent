@@ -3,6 +3,8 @@ from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+import config
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 HEADERS = [
@@ -25,6 +27,19 @@ HEADERS = [
     "Date Added",
 ]
 
+RECRUITER_HEADERS = [
+    "Company",
+    "Job Title",
+    "Job URL",
+    "Recruiter Name",
+    "Title",
+    "LinkedIn",
+    "Email",
+    "Confidence",
+    "Domain",
+    "Date Found",
+]
+
 
 class SheetsWriter:
     def __init__(self, credentials_file: str, spreadsheet_id: str):
@@ -35,7 +50,7 @@ class SheetsWriter:
         service = build("sheets", "v4", credentials=creds)
         self.sheet = service.spreadsheets()
 
-        self._counters = {"Strong Fit": 0, "Maybe": 0}
+        self._counters = {"Strong Fit": 0, "Maybe": 0, config.RECRUITER_TAB: 0}
         self._setup_tabs()
 
     # ─────────────────────────────────────────────────────────────
@@ -50,6 +65,33 @@ class SheetsWriter:
         self._counters["Maybe"] += 1
         self._write_row("Maybe", self._counters["Maybe"], card, jd, result)
 
+    def write_recruiter(self, card: dict, recruiter: dict):
+        tab = config.RECRUITER_TAB
+        row = [
+            card.get("company") or "",
+            card.get("title") or "",
+            card.get("job_url") or "",
+            recruiter.get("recruiter_name") or "",
+            recruiter.get("recruiter_title") or "",
+            recruiter.get("recruiter_linkedin") or "",
+            recruiter.get("email") or "",
+            recruiter.get("confidence") or "",
+            recruiter.get("domain") or "",
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+        ]
+
+        self.sheet.values().append(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"'{tab}'!A:A",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+
+        name    = recruiter.get("recruiter_name") or "unknown"
+        company = card.get("company") or "?"
+        print(f"    📝 → '{tab}': {name} @ {company}")
+
     # ─────────────────────────────────────────────────────────────
     # Setup
     # ─────────────────────────────────────────────────────────────
@@ -58,8 +100,12 @@ class SheetsWriter:
         meta = self.sheet.get(spreadsheetId=self.spreadsheet_id).execute()
         existing = [s["properties"]["title"] for s in meta["sheets"]]
 
+        tabs_to_create = ["Strong Fit", "Maybe"]
+        if config.RECRUITER_SEARCH_ENABLED:
+            tabs_to_create.append(config.RECRUITER_TAB)
+
         requests = []
-        for tab in ["Strong Fit", "Maybe"]:
+        for tab in tabs_to_create:
             if tab not in existing:
                 requests.append({"addSheet": {"properties": {"title": tab}}})
 
@@ -91,6 +137,26 @@ class SheetsWriter:
             else:
                 # Subtract 1 for the header row
                 self._counters[tab] = max(0, len(rows) - 1)
+
+        if config.RECRUITER_SEARCH_ENABLED:
+            tab = config.RECRUITER_TAB
+            rows = (
+                self.sheet.values()
+                .get(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"'{tab}'!A:A",
+                )
+                .execute()
+                .get("values", [])
+            )
+            if not rows:
+                self.sheet.values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"'{tab}'!A1",
+                    valueInputOption="RAW",
+                    body={"values": [RECRUITER_HEADERS]},
+                ).execute()
+                self._format_header(tab)
 
     def _format_header(self, tab: str):
         """Bold + freeze the header row."""

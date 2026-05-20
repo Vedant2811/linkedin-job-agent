@@ -7,6 +7,7 @@ import config
 from modules.browser import BrowserManager
 from modules.database import JobDatabase
 from modules.prefilter import PreFilter
+from modules.recruiter_finder import RecruiterFinder
 from modules.scorer import GeminiScorer
 from modules.scraper import JobScraper
 from modules.sheets import SheetsWriter
@@ -19,8 +20,11 @@ def main():
 
     # ── Pre-flight checks ────────────────────────────────────────
     if not os.environ.get("GEMINI_API_KEY"):
-        print("❌  GEMINI_API_KEY not set.")
-        print("    Run:  export GEMINI_API_KEY=your_key_here")
+        print("❌  GEMINI_API_KEY not set. Add it to your .env file.")
+        sys.exit(1)
+
+    if not os.environ.get("SPREADSHEET_ID"):
+        print("❌  SPREADSHEET_ID not set. Add it to your .env file.")
         sys.exit(1)
 
     if not os.path.exists(config.CREDENTIALS_FILE):
@@ -63,8 +67,9 @@ def main():
     print("\n🔌  Connecting to Chrome...")
 
     with BrowserManager(port=config.CHROME_DEBUG_PORT) as bm:
-        scraper  = JobScraper(bm)
-        page_num = 1
+        scraper          = JobScraper(bm)
+        recruiter_finder = RecruiterFinder(bm)
+        page_num         = 1
 
         while stats["scanned"] < config.MAX_JOBS:
             print(f"\n{'─' * 60}")
@@ -144,6 +149,31 @@ def main():
                     stats["strong_fit"] += 1
                     print(f"           ✅  Score {score}/10  →  Strong Fit!")
                     sheets.write_strong_fit(card, jd, result)
+
+                    if config.RECRUITER_SEARCH_ENABLED:
+                        try:
+                            company = card.get("company") or ""
+                            print("           🔎  Searching for recruiter...")
+                            recruiter = recruiter_finder.find(
+                                company, card["job_url"], jd
+                            )
+                            if recruiter["confidence"] in (
+                                "high", "medium"
+                            ):
+                                name  = recruiter.get("recruiter_name") or "?"
+                                email = recruiter.get("email") or "?"
+                                print(
+                                    f"           📇  Found: {name}  "
+                                    f"({recruiter['confidence']})  {email}"
+                                )
+                                sheets.write_recruiter(card, recruiter)
+                            else:
+                                print(
+                                    f"           ⚠️   Recruiter not found "
+                                    f"(confidence: {recruiter['confidence']})"
+                                )
+                        except Exception as e:
+                            print(f"           ⚠️   Recruiter search error: {e}")
 
                 elif score >= config.MAYBE_THRESHOLD:
                     stats["maybe"] += 1
